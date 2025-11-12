@@ -125,27 +125,63 @@ class BatchedInferencePipeline:
         segmented_outputs = []
         segment_sizes = []
         for chunk_metadata, output in zip(chunks_metadata, outputs):
-            duration = chunk_metadata["duration"]
+            duration = chunk_metadata["duration"] if "duration" in chunk_metadata else chunk_metadata["end_time"] - chunk_metadata["start_time"]
             segment_size = int(ceil(duration) * self.model.frames_per_second)
-            segment_sizes.append(segment_size)
-            segmented_outputs.append(
-                [
-                    dict(
-                        text=tokenizer.decode(output["tokens"]),
-                        avg_logprob=output["avg_logprob"],
-                        no_speech_prob=output["no_speech_prob"],
-                        tokens=output["tokens"],
-                        start=chunk_metadata["start_time"],
-                        end=chunk_metadata["end_time"],
-                        compression_ratio=get_compression_ratio(
-                            tokenizer.decode(output["tokens"])
-                        ),
-                        seek=int(
-                            chunk_metadata["start_time"] * self.model.frames_per_second
-                        ),
-                    )
-                ]
-            )
+            segment_sizes.append(segment_size)            
+            if options.clip_timestamps:
+                # run subsegment related processing
+                (
+                    subsegments,
+                    seek,
+                    single_timestamp_ending,
+                ) = self.model._split_segments_by_timestamps(
+                    tokenizer=tokenizer,
+                    tokens=output["tokens"],
+                    time_offset=chunk_metadata["offset"],
+                    segment_size=segment_size,
+                    segment_duration=duration,
+                    seek=0,
+                )
+                segmented_outputs.append(
+                    [
+                        dict(
+                            text=tokenizer.decode(subsegment["tokens"]),
+                            avg_logprob=output["avg_logprob"],
+                            no_speech_prob=output["no_speech_prob"],
+                            tokens=subsegment["tokens"],
+                            start=subsegment["start"],
+                            end=subsegment["end"],
+                            compression_ratio=get_compression_ratio(
+                                tokenizer.decode(subsegment["tokens"])
+                            ),
+                            seek=int(
+                                chunk_metadata["offset"] * self.model.frames_per_second
+                            ),
+                        )
+                        for subsegment in subsegments
+                    ]
+                )
+            else:
+                segmented_outputs.append(
+                    [
+                        dict(
+                            text=tokenizer.decode(output["tokens"]),
+                            avg_logprob=output["avg_logprob"],
+                            no_speech_prob=output["no_speech_prob"],
+                            tokens=output["tokens"],
+                            start=chunk_metadata["start_time"],
+                            end=chunk_metadata["end_time"],
+                            compression_ratio=get_compression_ratio(
+                                tokenizer.decode(output["tokens"])
+                            ),
+                            seek=int(
+                                chunk_metadata["start_time"] * self.model.frames_per_second
+                            ),
+                        )
+                    ]
+                )
+            
+
         if options.word_timestamps:
             self.last_speech_timestamp = self.model.add_word_timestamps(
                 segmented_outputs,
@@ -391,6 +427,7 @@ class BatchedInferencePipeline:
                 for chunk in audio_chunks
             ]
             duration = sum(chunk.shape[0] for chunk in audio_chunks) / sampling_rate
+            clip_timestamps_provided = False
         else:
             duration = audio.shape[0] / sampling_rate
 
@@ -430,7 +467,7 @@ class BatchedInferencePipeline:
                 audio, clip_timestamps, max_duration=chunk_length
             )
 
-        else:
+        elif audio_chunks is None:
             clip_timestamps_provided = True
             clip_timestamps = [
                 {k: int(v * sampling_rate) for k, v in segment.items()}
