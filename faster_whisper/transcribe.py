@@ -125,40 +125,63 @@ class BatchedInferencePipeline:
         segmented_outputs = []
         segment_sizes = []
         for chunk_metadata, output in zip(chunks_metadata, outputs):
-            duration = chunk_metadata["duration"]
+            duration = chunk_metadata["duration"] if "duration" in chunk_metadata else chunk_metadata["end_time"] - chunk_metadata["start_time"]
             segment_size = int(ceil(duration) * self.model.frames_per_second)
-            segment_sizes.append(segment_size)
-            (
-                subsegments,
-                seek,
-                single_timestamp_ending,
-            ) = self.model._split_segments_by_timestamps(
-                tokenizer=tokenizer,
-                tokens=output["tokens"],
-                time_offset=chunk_metadata["offset"],
-                segment_size=segment_size,
-                segment_duration=duration,
-                seek=0,
-            )
-            segmented_outputs.append(
-                [
-                    dict(
-                        text=tokenizer.decode(subsegment["tokens"]),
-                        avg_logprob=output["avg_logprob"],
-                        no_speech_prob=output["no_speech_prob"],
-                        tokens=subsegment["tokens"],
-                        start=subsegment["start"],
-                        end=subsegment["end"],
-                        compression_ratio=get_compression_ratio(
-                            tokenizer.decode(subsegment["tokens"])
-                        ),
-                        seek=int(
-                            chunk_metadata["offset"] * self.model.frames_per_second
-                        ),
-                    )
-                    for subsegment in subsegments
-                ]
-            )
+            segment_sizes.append(segment_size)            
+            if options.clip_timestamps:
+                # run subsegment related processing
+                (
+                    subsegments,
+                    seek,
+                    single_timestamp_ending,
+                ) = self.model._split_segments_by_timestamps(
+                    tokenizer=tokenizer,
+                    tokens=output["tokens"],
+                    time_offset=chunk_metadata["offset"],
+                    segment_size=segment_size,
+                    segment_duration=duration,
+                    seek=0,
+                )
+                segmented_outputs.append(
+                    [
+                        dict(
+                            text=tokenizer.decode(subsegment["tokens"]),
+                            avg_logprob=output["avg_logprob"],
+                            no_speech_prob=output["no_speech_prob"],
+                            tokens=subsegment["tokens"],
+                            start=subsegment["start"],
+                            end=subsegment["end"],
+                            compression_ratio=get_compression_ratio(
+                                tokenizer.decode(subsegment["tokens"])
+                            ),
+                            seek=int(
+                                chunk_metadata["offset"] * self.model.frames_per_second
+                            ),
+                        )
+                        for subsegment in subsegments
+                    ]
+                )
+            else:
+                segmented_outputs.append(
+                    [
+                        dict(
+                            text=tokenizer.decode(output["tokens"]),
+                            avg_logprob=output["avg_logprob"],
+                            no_speech_prob=output["no_speech_prob"],
+                            tokens=output["tokens"],
+                            start=chunk_metadata["start_time"],
+                            end=chunk_metadata["end_time"],
+                            compression_ratio=get_compression_ratio(
+                                tokenizer.decode(output["tokens"])
+                            ),
+                            seek=int(
+                                chunk_metadata["start_time"] * self.model.frames_per_second
+                            ),
+                        )
+                    ]
+                )
+            
+
         if options.word_timestamps:
             self.last_speech_timestamp = self.model.add_word_timestamps(
                 segmented_outputs,
@@ -169,7 +192,6 @@ class BatchedInferencePipeline:
                 options.append_punctuations,
                 self.last_speech_timestamp,
             )
-
         return segmented_outputs
 
     def generate_segment_batched(
@@ -254,7 +276,7 @@ class BatchedInferencePipeline:
 
     def transcribe(
         self,
-        audio: Union[str, BinaryIO, np.ndarray],
+        audio: Union[str, BinaryIO, np.ndarray, list[np.ndarray]],
         language: Optional[str] = None,
         task: str = "transcribe",
         log_progress: bool = False,
@@ -302,7 +324,8 @@ class BatchedInferencePipeline:
         """transcribe audio in chunks in batched fashion and return with language info.
 
         Arguments:
-            audio: Path to the input file (or a file-like object), or the audio waveform.
+            audio: Path to the input file (or a file-like object), the audio waveform or
+            a list of audio waveforms (for batch processing).
             language: The language spoken in the audio. It should be a language code such
                 as "en" or "fr". If not set, the language will be detected in the first 30 seconds
                 of audio.
@@ -385,9 +408,28 @@ class BatchedInferencePipeline:
             )
             multilingual = False
 
-        if not isinstance(audio, np.ndarray):
+        if not isinstance(audio, np.ndarray) and not isinstance(audio, list):
             audio = decode_audio(audio, sampling_rate=sampling_rate)
-        duration = audio.shape[0] / sampling_rate
+
+        # check if audio is a list, then we assume each item is an audio waveform
+        # to process as a batch
+        audio_chunks = None
+        if isinstance(audio, list):
+            # verify that each item is a numpy array
+            for item in audio:
+                if not isinstance(item, np.ndarray):
+                    raise ValueError(
+                        "If audio is a list, each item must be a numpy array of the audio waveform."
+                    )
+            audio_chunks = audio
+            chunks_metadata = [
+                {"start_time": 0, "end_time": chunk.shape[0] / sampling_rate}
+                for chunk in audio_chunks
+            ]
+            duration = sum(chunk.shape[0] for chunk in audio_chunks) / sampling_rate
+            clip_timestamps_provided = False
+        else:
+            duration = audio.shape[0] / sampling_rate
 
         self.model.logger.info(
             "Processing audio with duration %s", format_timestamp(duration)
@@ -395,7 +437,7 @@ class BatchedInferencePipeline:
 
         chunk_length = chunk_length or self.model.feature_extractor.chunk_length
         # if no segment split is provided, use vad_model and generate segments
-        if not clip_timestamps:
+        if not clip_timestamps and audio_chunks is None:
             if vad_filter:
                 if vad_parameters is None:
                     vad_parameters = VadOptions(
@@ -425,7 +467,7 @@ class BatchedInferencePipeline:
                 audio, clip_timestamps, max_duration=chunk_length
             )
 
-        else:
+        elif audio_chunks is None:
             clip_timestamps_provided = True
             clip_timestamps = [
                 {k: int(v * sampling_rate) for k, v in segment.items()}
@@ -453,8 +495,12 @@ class BatchedInferencePipeline:
                 )
 
         duration_after_vad = (
-            sum((segment["end"] - segment["start"]) for segment in clip_timestamps)
-            / sampling_rate
+            (
+                sum((segment["end"] - segment["start"]) for segment in clip_timestamps)
+                / sampling_rate
+            )
+            if clip_timestamps
+            else duration
         )
 
         self.model.logger.info(
@@ -573,7 +619,7 @@ class BatchedInferencePipeline:
             options,
             log_progress,
         )
-        if not clip_timestamps_provided:
+        if not clip_timestamps_provided and not isinstance(audio, list):
             segments = restore_speech_timestamps(
                 segments, clip_timestamps, sampling_rate
             )
